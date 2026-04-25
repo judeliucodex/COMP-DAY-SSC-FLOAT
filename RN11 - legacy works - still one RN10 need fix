@@ -1,0 +1,634 @@
+#include <Wire.h>
+#include <MS5837.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include <ArduinoOTA.h>
+#include <Update.h>
+#include <math.h> 
+
+// --- I2C PINS ---
+#define CUSTOM_SDA_PIN 21
+#define CUSTOM_SCL_PIN 22
+
+MS5837 sensor;
+bool sensorActive = false; 
+
+// --- WIFI CREDENTIALS ---
+const char* ssid     = "SSCFloat RN11";
+const char* password = "DT1234dt";
+WebServer server(80);
+
+// --- SENSOR VARIABLES ---
+#define MAX_PACKETS 240
+char dataPackets[MAX_PACKETS][32]; 
+int sensorIdx = 0;
+int iterationCount = 0;
+float currentRelativeDepth = 0.0; 
+float surfaceDepthOffset = 0.0;   
+
+// --- MOTOR PINS & SETTINGS ---
+const int dirPin  = 4;
+const int stepPin = 16;
+int motorSpeed = 2000;
+
+// --- LIMIT SWITCHES ---
+#define BUTTON_PIN_1 19    // Bottom / Sinking limit
+#define BUTTON_PIN_2 18    // Top / Floating limit
+
+// --- STATE MACHINE ---
+enum SystemMode {
+  MODE_IDLE,
+  MODE_SEQUENCE,
+  MODE_TIMED_DOWN,
+  MODE_HOLD_DEPTH,
+  MODE_TARGET_DEPTH 
+};
+volatile SystemMode currentMode = MODE_IDLE; 
+
+// --- CONFIGURATION VARIABLES ---
+uint32_t floatWaitTimeMs = 45000;      
+uint32_t sensorReadIntervalMs = 100;   
+uint32_t sensorLogIntervalMs = 1000;   
+uint32_t timedDownDurationMs = 0; 
+float depthToleranceCm = 30.0;         
+bool returnToSurfaceAfterHold = false; 
+
+// --- TARGET DEPTH VARIABLES ---
+float targetDepthSetpoint = 0.0;
+bool targetDepthReturn = false;
+bool targetDepthForever = false;
+
+// --- MUTEXES & TASK HANDLES ---
+SemaphoreHandle_t dataLock = NULL;
+SemaphoreHandle_t modeLock = NULL;
+SemaphoreHandle_t configLock = NULL;
+
+TaskHandle_t sensorTaskHandle = NULL;
+TaskHandle_t webTaskHandle = NULL;
+TaskHandle_t motorTaskHandle = NULL;
+
+// --- SENSOR TASK ---
+void sensorTask(void *parameter) {
+  static float lastValidDepth = 0.0;
+  static bool firstReading = true;
+  static uint32_t lastLogTime = 0; 
+
+  while(1) {
+    if (sensorActive) {
+      sensor.read();
+      
+      if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+        // Keeps negative logic: deeper = more negative
+        float newRelativeDepth = -(sensor.depth() - surfaceDepthOffset); 
+        
+        if (firstReading || fabs(newRelativeDepth - lastValidDepth) <= 2.0) {
+          
+          currentRelativeDepth = newRelativeDepth; 
+          lastValidDepth = newRelativeDepth; 
+          firstReading = false;
+          
+          uint32_t currentLogInterval = 1000;
+          if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+             currentLogInterval = sensorLogIntervalMs;
+             xSemaphoreGive(configLock);
+          }
+
+          if (millis() - lastLogTime >= currentLogInterval) {
+            unsigned long floatTimeSec = millis() / 1000; 
+            float pressureKpa = sensor.pressure() / 10.0; 
+
+            snprintf(dataPackets[sensorIdx], 32, "RN11 %lus %.1fkpa %.2fm", 
+                     floatTimeSec, pressureKpa, currentRelativeDepth);
+
+            sensorIdx = (sensorIdx + 1) % MAX_PACKETS;
+            iterationCount++;
+            lastLogTime = millis(); 
+          }
+          
+        } else {
+          Serial.print("WARNING: Sensor spike filtered! Attempted depth: ");
+          Serial.println(newRelativeDepth);
+        }
+        
+        xSemaphoreGive(dataLock);
+      }
+    } else {
+      uint32_t currentLogInterval = 1000;
+      if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+         currentLogInterval = sensorLogIntervalMs;
+         xSemaphoreGive(configLock);
+      }
+
+      if (millis() - lastLogTime >= currentLogInterval) {
+        if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+          unsigned long floatTimeSec = millis() / 1000;
+          snprintf(dataPackets[sensorIdx], 32, "RN10 %lus SENSOR_ERROR", floatTimeSec);
+          sensorIdx = (sensorIdx + 1) % MAX_PACKETS;
+          iterationCount++;
+          lastLogTime = millis();
+          xSemaphoreGive(dataLock);
+        }
+      }
+    }
+    
+    uint32_t delayMs = 100; 
+    if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+      delayMs = sensorReadIntervalMs;
+      xSemaphoreGive(configLock);
+    }
+    vTaskDelay(pdMS_TO_TICKS(delayMs)); 
+  }
+}
+
+// --- WEB SERVER TASK ---
+void webTask(void *parameter) {
+  while(1) {
+    server.handleClient();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// --- WEB ENDPOINTS ---
+
+void handleData() {
+  if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+    int clientLastIter = -1;
+    if (server.hasArg("last")) {
+      clientLastIter = server.arg("last").toInt();
+    }
+
+    String data = "ITER:" + String(iterationCount) + "\n";
+    data += sensorActive ? "Current Depth: " + String(currentRelativeDepth * 100.0) + " cm\n" : "SENSOR DISCONNECTED\n";
+
+    int totalAvailable = iterationCount < MAX_PACKETS ? iterationCount : MAX_PACKETS;
+    int newPackets = iterationCount - clientLastIter;
+
+    if (clientLastIter == -1 || newPackets > totalAvailable) {
+      newPackets = totalAvailable;
+    } else if (newPackets < 0) {
+      newPackets = 0; 
+    }
+
+    data.reserve(newPackets * 32 + 100);
+
+    for (int i = 0; i < newPackets; i++) {
+      int idx = (sensorIdx - 1 - i + MAX_PACKETS) % MAX_PACKETS;
+      data += String(dataPackets[idx]) + "\n";
+    }
+
+    xSemaphoreGive(dataLock);
+    server.send(200, "text/plain", data);
+  }
+}
+
+void handleLive() {
+  String html = R"rawliteral(
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta name='viewport' content='width=device-width, initial-scale=1'>
+    <style>
+      body { font-family: Arial; padding: 10px; background-color: #f4f4f4; margin: 0; }
+      h2 { color: #333; }
+      #logBox { background: #222; color: #0f0; padding: 15px; height: 60vh; overflow-y: auto; font-family: monospace; border-radius: 5px; box-shadow: inset 0 0 10px #000; font-size: 16px; }
+      .header { font-weight: bold; font-size: 1.2em; margin-bottom: 10px; background: #fff; padding: 10px; border-radius: 5px; border: 1px solid #ccc; display: inline-block; }
+      button { padding: 15px; margin-top: 15px; font-size: 16px; width: 100%; max-width: 400px; display: block; background-color: #4CAF50; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; }
+      button:hover { background-color: #45a049; }
+    </style>
+    <script>
+      let lastIter = -1; 
+      async function fetchNewData() {
+        try {
+          let response = await fetch('/data?last=' + lastIter);
+          let text = await response.text();
+          let lines = text.split('\n');
+          if (lines[0].startsWith("ITER:")) lastIter = parseInt(lines[0].split(':')[1]);
+          document.getElementById('depthDisplay').innerText = lines[1];
+          let logBox = document.getElementById('logBox');
+          let newDataAdded = false;
+          for (let i = lines.length - 1; i >= 2; i--) {
+            if (lines[i].trim() !== "") {
+              logBox.innerHTML += lines[i] + "<br>";
+              newDataAdded = true;
+            }
+          }
+          if (newDataAdded) logBox.scrollTop = logBox.scrollHeight;
+        } catch (error) {
+          document.getElementById('depthDisplay').innerText = "CONNECTION LOST - Retrying...";
+        }
+        setTimeout(fetchNewData, 500); 
+      }
+      window.onload = fetchNewData;
+    </script>
+  </head>
+  <body>
+    <h2>Live ROV Telemetry</h2>
+    <div id="depthDisplay" class="header">Loading...</div>
+    <div id="logBox"></div>
+    <button onclick="location.href='/control'">Back to Control</button>
+  </body>
+  </html>
+  )rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+void handleControl() {
+  if(server.hasArg("action")) {
+    String action = server.arg("action");
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      if (action == "start") {
+        currentMode = MODE_SEQUENCE;
+      } else if (action == "stop") {
+        currentMode = MODE_IDLE;
+      } else if (action == "godown" && server.hasArg("duration")) {
+        timedDownDurationMs = server.arg("duration").toInt() * 1000;
+        returnToSurfaceAfterHold = server.hasArg("comebackup"); 
+        currentMode = MODE_TIMED_DOWN;
+      } else if (action == "targetdepth" && server.hasArg("depth")) {
+        targetDepthSetpoint = server.arg("depth").toFloat() / 100.0; // Captures negative values
+        targetDepthReturn = server.hasArg("comebackup_depth");
+        targetDepthForever = server.hasArg("holdforever");
+        
+        if (targetDepthReturn) targetDepthForever = false;
+        
+        currentMode = MODE_TARGET_DEPTH;
+      }
+      xSemaphoreGive(modeLock);
+    }
+    server.sendHeader("Location", "/control");
+    server.send(303);
+    return;
+  } 
+
+  SystemMode modeCopy;
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    modeCopy = currentMode;
+    xSemaphoreGive(modeLock);
+  }
+
+  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>button { padding: 15px; margin: 10px auto; font-size: 18px; width: 90%; max-width: 400px; display: block; border-radius: 5px; border: none; cursor: pointer; font-weight: bold;} ";
+  html += "input[type='number'] { padding:12px; margin:10px auto; font-size:16px; width:90%; max-width:400px; display: block; border-radius: 5px; border: 1px solid #ccc; box-sizing: border-box; }";
+  html += ".start { background-color: #ddd; color: #333; }";
+  html += ".stop { background-color: #ff4c4c; color: white; } ";
+  html += ".godown { background-color: #ff9800; color: white; } ";
+  html += ".gotarget { background-color: #9c27b0; color: white; } ";
+  html += ".error { color: #ff4c4c; font-weight: bold; border: 2px solid #ff4c4c; padding: 10px; display: inline-block; background-color: #ffe6e6; border-radius: 5px;}";
+  html += ".config { background-color: #4CAF50; color: white; }";
+  html += ".live { background-color: #008CBA; color: white; }";
+  html += ".toggle-box { margin: 10px auto; width: 90%; max-width: 400px; text-align: left; font-size: 16px; font-weight: bold;}</style>";
+  
+  html += "<script>function toggleCb(clicked) {";
+  html += "let ret = document.getElementById('retCb'); let forever = document.getElementById('forCb');";
+  html += "if(clicked === 'ret' && ret.checked) forever.checked = false;";
+  html += "if(clicked === 'for' && forever.checked) ret.checked = false;";
+  html += "}</script></head><body style='font-family:Arial; text-align:center;'>";
+  
+  html += "<h2>MATE ROV Float Controller</h2>";
+  
+  if (!sensorActive) html += "<p class='error'>WARNING: Pressure sensor not connected</p>";
+
+  if (modeCopy == MODE_IDLE) html += "<p>Status: <strong>IDLE</strong></p>";
+  else if (modeCopy == MODE_SEQUENCE) html += "<p>Status: <strong style='color:green;'>RUNNING SEQUENCE</strong></p>";
+  else if (modeCopy == MODE_TIMED_DOWN) html += "<p>Status: <strong style='color:#ff9800;'>MANUAL DESCENT</strong></p>";
+  else if (modeCopy == MODE_HOLD_DEPTH) html += "<p>Status: <strong style='color:#008CBA;'>HOLDING SNAPSHOT DEPTH</strong></p>";
+  else if (modeCopy == MODE_TARGET_DEPTH) html += "<p>Status: <strong style='color:#9c27b0;'>HOLDING TARGET DEPTH</strong></p>";
+
+  html += "<button class='start' onclick=\"location.href='/control?action=start'\">Run Full Sequence</button>";
+  html += "<button class='stop' onclick=\"location.href='/control?action=stop'\">EMERGENCY STOP</button>";
+  
+  html += "<hr><h3>Override: Time-Based Descent</h3>";
+  html += "<form action='/control' method='GET'>";
+  html += "<input type='hidden' name='action' value='godown'>";
+  html += "<input type='number' name='duration' placeholder='Seconds to go down' required min='1'>";
+  html += "<div class='toggle-box'><label><input type='checkbox' name='comebackup' value='yes' style='transform: scale(1.5); margin-right: 10px;'> Return to surface after holding</label></div>";
+  html += "<button type='submit' class='godown'>Go Down & Hold</button>";
+  html += "</form>";
+
+  html += "<hr><h3>Override: Target Depth Descent</h3>";
+  html += "<form action='/control' method='GET'>";
+  html += "<input type='hidden' name='action' value='targetdepth'>";
+  // Changed this input to max='0' to allow and enforce negative depth entries 
+  html += "<input type='number' name='depth' placeholder='Target Depth (e.g. -40 cm)' required max='0'>";
+  
+  html += "<div class='toggle-box'><label><input type='checkbox' id='retCb' name='comebackup_depth' value='yes' onclick=\"toggleCb('ret')\" style='transform: scale(1.5); margin-right: 10px;'> Return to surface after holding</label></div>";
+  html += "<div class='toggle-box'><label><input type='checkbox' id='forCb' name='holdforever' value='yes' onclick=\"toggleCb('for')\" style='transform: scale(1.5); margin-right: 10px;'> Hold forever (infinite)</label></div>";
+
+  html += "<button type='submit' class='gotarget'>Go to Depth & Hold</button>";
+  html += "</form>";
+
+  html += "<hr>";
+  html += "<button class='live' onclick=\"location.href='/live'\">Live Telemetry</button>";
+  html += "<button class='config' onclick=\"location.href='/config'\">Settings</button>";
+  
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleConfig() {
+  if (server.method() == HTTP_POST || server.args() > 0) {
+    if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+      if (server.hasArg("waitTime") && server.arg("waitTime") != "") floatWaitTimeMs = server.arg("waitTime").toInt();
+      if (server.hasArg("sensorInterval") && server.arg("sensorInterval") != "") sensorReadIntervalMs = server.arg("sensorInterval").toInt();
+      if (server.hasArg("logInterval") && server.arg("logInterval") != "") sensorLogIntervalMs = server.arg("logInterval").toInt();
+      if (server.hasArg("tolerance") && server.arg("tolerance") != "") depthToleranceCm = server.arg("tolerance").toFloat(); 
+      xSemaphoreGive(configLock);
+    }
+    server.sendHeader("Location", "/config");
+    server.send(303);
+    return;
+  }
+
+  uint32_t currWait = 0, currReadInterval = 0, currLogInterval = 0;
+  float currTolerance = 0.0;
+  if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+    currWait = floatWaitTimeMs;
+    currReadInterval = sensorReadIntervalMs;
+    currLogInterval = sensorLogIntervalMs;
+    currTolerance = depthToleranceCm;
+    xSemaphoreGive(configLock);
+  }
+
+  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial;} input, button{padding:12px; margin:5px 0 15px 0; font-size:16px; width:90%; max-width:400px; border-radius: 5px; border: 1px solid #ccc;}";
+  html += "button { background-color: #4CAF50; color: white; border: none; cursor: pointer; font-weight: bold;}";
+  html += ".back { background-color: #ddd; color: #333; }</style></head><body>";
+  html += "<h2>Float Configuration</h2>";
+  html += "<form action='/config' method='POST'>";
+  
+  html += "<label>Wait Time at Bottom / Hold Time (ms):<br><strong>Current = " + String(currWait) + " ms</strong></label><br>";
+  html += "<input type='number' name='waitTime' placeholder='Leave blank to keep current'><br>";
+  
+  html += "<label>Sensor Read Interval (ms):<br><strong>Current = " + String(currReadInterval) + " ms</strong></label><br>";
+  html += "<input type='number' name='sensorInterval' placeholder='Leave blank to keep current'><br>";
+
+  html += "<label>Sensor Log Interval (ms):<br><strong>Current = " + String(currLogInterval) + " ms</strong></label><br>";
+  html += "<input type='number' name='logInterval' placeholder='Leave blank to keep current'><br>";
+
+  html += "<label>Depth Tolerance / Deadband (cm):<br><strong>Current = " + String(currTolerance, 1) + " cm</strong></label><br>";
+  html += "<input type='number' step='0.1' name='tolerance' placeholder='Leave blank to keep current'><br>";
+
+  html += "<button type='submit'>Save Changes</button>";
+  html += "</form><hr><button class='back' onclick=\"location.href='/control'\">Back to Control</button></body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void stepMotorChunk(int steps, SystemMode expectedMode) {
+  for (int i = 0; i < steps; i++) {
+    if (currentMode != expectedMode) return; 
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(motorSpeed);
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(motorSpeed);
+    if (i % 20 == 0) taskYIELD(); 
+  }
+}
+
+void runStepperSequence() {
+  digitalWrite(dirPin, HIGH);
+  while(digitalRead(BUTTON_PIN_1) == HIGH && currentMode == MODE_SEQUENCE) stepMotorChunk(20, MODE_SEQUENCE);
+  if (currentMode != MODE_SEQUENCE) return; 
+  
+  uint32_t waitTime = 45000; 
+  if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+    waitTime = floatWaitTimeMs;
+    xSemaphoreGive(configLock);
+  }
+  
+  uint32_t startTime = millis();
+  while ((millis() - startTime) < waitTime) {
+    if (currentMode != MODE_SEQUENCE) return; 
+    vTaskDelay(pdMS_TO_TICKS(100)); 
+  }
+  
+  if (currentMode != MODE_SEQUENCE) return; 
+  digitalWrite(dirPin, LOW);
+  while(digitalRead(BUTTON_PIN_2) == HIGH && currentMode == MODE_SEQUENCE) stepMotorChunk(20, MODE_SEQUENCE);
+  
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    if (currentMode == MODE_SEQUENCE) currentMode = MODE_IDLE;
+    xSemaphoreGive(modeLock);
+  }
+}
+
+void runTimedDownSequence() {
+  uint32_t durationMs = 0;
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    durationMs = timedDownDurationMs;
+    xSemaphoreGive(modeLock);
+  }
+
+  digitalWrite(dirPin, HIGH); 
+  uint32_t startTime = millis();
+
+  while ((millis() - startTime) < durationMs && digitalRead(BUTTON_PIN_1) == HIGH && currentMode == MODE_TIMED_DOWN) {
+    stepMotorChunk(20, MODE_TIMED_DOWN);
+  }
+
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    if (currentMode == MODE_TIMED_DOWN) currentMode = MODE_HOLD_DEPTH;
+    xSemaphoreGive(modeLock);
+  }
+}
+
+void runHoldDepthSequence() {
+  uint32_t holdDurationMs = 45000;
+  float deadband = 0.30; 
+
+  if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+    holdDurationMs = floatWaitTimeMs;
+    deadband = depthToleranceCm / 100.0; 
+    xSemaphoreGive(configLock);
+  }
+
+  float targetDepth = 0.0;
+  if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+    targetDepth = currentRelativeDepth;
+    xSemaphoreGive(dataLock);
+  }
+
+  uint32_t startTime = millis();
+
+  while ((millis() - startTime) < holdDurationMs && currentMode == MODE_HOLD_DEPTH) {
+    
+    float currentDepthCopy = 0.0;
+    if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+      currentDepthCopy = currentRelativeDepth;
+      xSemaphoreGive(dataLock);
+    }
+
+    // MATH FLIPPED FOR NEGATIVE LOGIC:
+    // If current is GREATER than target (e.g. 0.0 > -0.4), we are above target and must SINK.
+    if (currentDepthCopy > (targetDepth + deadband)) {
+      digitalWrite(dirPin, HIGH); 
+      if (digitalRead(BUTTON_PIN_1) == HIGH) stepMotorChunk(20, MODE_HOLD_DEPTH);
+      else vTaskDelay(pdMS_TO_TICKS(50)); 
+    } 
+    // If current is LESS than target (e.g. -0.8 < -0.4), we are below target and must FLOAT.
+    else if (currentDepthCopy < (targetDepth - deadband)) {
+      digitalWrite(dirPin, LOW); 
+      if (digitalRead(BUTTON_PIN_2) == HIGH) stepMotorChunk(20, MODE_HOLD_DEPTH);
+      else vTaskDelay(pdMS_TO_TICKS(50)); 
+    } 
+    else {
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+  }
+
+  bool shouldSurface = false;
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    shouldSurface = returnToSurfaceAfterHold;
+    xSemaphoreGive(modeLock);
+  }
+
+  if (shouldSurface && currentMode == MODE_HOLD_DEPTH) {
+    digitalWrite(dirPin, LOW); 
+    while (digitalRead(BUTTON_PIN_2) == HIGH && currentMode == MODE_HOLD_DEPTH) {
+      stepMotorChunk(20, MODE_HOLD_DEPTH);
+    }
+  }
+
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    if (currentMode == MODE_HOLD_DEPTH) currentMode = MODE_IDLE;
+    xSemaphoreGive(modeLock);
+  }
+}
+
+void runTargetDepthSequence() {
+  uint32_t holdDurationMs = 45000;
+  float deadband = 0.30; 
+  
+  if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+    holdDurationMs = floatWaitTimeMs;
+    deadband = depthToleranceCm / 100.0; 
+    xSemaphoreGive(configLock);
+  }
+
+  float target = 0.0;
+  bool shouldSurface = false;
+  bool forever = false;
+  
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    target = targetDepthSetpoint;
+    shouldSurface = targetDepthReturn;
+    forever = targetDepthForever;
+    xSemaphoreGive(modeLock);
+  }
+
+  bool targetReached = false;
+  uint32_t holdStartTime = 0;
+
+  while (currentMode == MODE_TARGET_DEPTH) {
+    
+    float currentDepthCopy = 0.0;
+    if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+      currentDepthCopy = currentRelativeDepth;
+      xSemaphoreGive(dataLock);
+    }
+
+    // MATH FLIPPED FOR NEGATIVE LOGIC:
+    if (currentDepthCopy > (target + deadband)) {
+      digitalWrite(dirPin, HIGH); // SINK
+      if (digitalRead(BUTTON_PIN_1) == HIGH) stepMotorChunk(20, MODE_TARGET_DEPTH);
+      else vTaskDelay(pdMS_TO_TICKS(50)); 
+    } 
+    else if (currentDepthCopy < (target - deadband)) {
+      digitalWrite(dirPin, LOW); // FLOAT
+      if (digitalRead(BUTTON_PIN_2) == HIGH) stepMotorChunk(20, MODE_TARGET_DEPTH);
+      else vTaskDelay(pdMS_TO_TICKS(50)); 
+    } 
+    else {
+      if (!targetReached) {
+        targetReached = true;
+        holdStartTime = millis(); 
+      }
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    if (targetReached && !forever) {
+      if (millis() - holdStartTime >= holdDurationMs) {
+        break; 
+      }
+    }
+  }
+
+  if (shouldSurface && currentMode == MODE_TARGET_DEPTH) {
+    digitalWrite(dirPin, LOW); 
+    while (digitalRead(BUTTON_PIN_2) == HIGH && currentMode == MODE_TARGET_DEPTH) {
+      stepMotorChunk(20, MODE_TARGET_DEPTH);
+    }
+  }
+
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    if (currentMode == MODE_TARGET_DEPTH) currentMode = MODE_IDLE;
+    xSemaphoreGive(modeLock);
+  }
+}
+
+void motorTask(void *parameter) {
+  while(1) {
+    SystemMode currentModeCopy;
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      currentModeCopy = currentMode;
+      xSemaphoreGive(modeLock);
+    }
+    
+    if (currentModeCopy == MODE_SEQUENCE) runStepperSequence();
+    else if (currentModeCopy == MODE_TIMED_DOWN) runTimedDownSequence();
+    else if (currentModeCopy == MODE_HOLD_DEPTH) runHoldDepthSequence();
+    else if (currentModeCopy == MODE_TARGET_DEPTH) runTargetDepthSequence(); 
+    else vTaskDelay(pdMS_TO_TICKS(100)); 
+  }
+}
+
+void setup() {
+  Serial.begin(115200); 
+  delay(1000);
+  
+  Wire.begin(CUSTOM_SDA_PIN, CUSTOM_SCL_PIN);
+  
+  if (sensor.init()) {
+    sensorActive = true;
+    sensor.setFluidDensity(997); 
+    sensor.read();
+    surfaceDepthOffset = sensor.depth(); 
+    Serial.println("Sensor Initialized.");
+  } else {
+    Serial.println("Sensor FAILED - Continuing to start Wi-Fi.");
+    sensorActive = false;
+  }
+  
+  pinMode(dirPin, OUTPUT);
+  pinMode(stepPin, OUTPUT);
+  pinMode(BUTTON_PIN_1, INPUT_PULLUP);
+  pinMode(BUTTON_PIN_2, INPUT_PULLUP); 
+  
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid, password);
+  WiFi.setSleep(false);
+  
+  ArduinoOTA.begin();
+  server.on("/data", handleData);
+  server.on("/live", handleLive);
+  server.on("/control", handleControl);
+  server.on("/config", handleConfig);
+  server.begin();
+  
+  dataLock = xSemaphoreCreateMutex();
+  modeLock = xSemaphoreCreateMutex();
+  configLock = xSemaphoreCreateMutex();
+  
+  xTaskCreatePinnedToCore(sensorTask, "SensorTask", 4096, NULL, 2, &sensorTaskHandle, 0);
+  xTaskCreatePinnedToCore(webTask, "WebTask", 4096, NULL, 1, &webTaskHandle, 0);
+  xTaskCreatePinnedToCore(motorTask, "MotorTask", 4096, NULL, 3, &motorTaskHandle, 1);
+}
+
+void loop() {
+  ArduinoOTA.handle(); 
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
