@@ -160,7 +160,10 @@
             if (parsedData.length === 0) return;
             parsedData.sort((a, b) => a.time - b.time);
             
+            // Update the UI title above the input box
             document.getElementById('graphTitle').innerText = `${currentFloatName} float pressure graph`;
+            
+            // Draw the graph (now including the title on canvas)
             drawGraph(parsedData);
         }
 
@@ -170,22 +173,32 @@
             const width = canvas.width;
             const height = canvas.height;
             
+            // Standard padding for graph elements
             const padLeft = 100;
             const padBottom = 80;
-            const padTop = 60;
+            const padTop = 80; // Increased slightly for title room
             const padRight = 60;
 
-            // Fetch interval settings, with fallbacks to prevent freezing if left blank
+            // Fetch interval settings
             let xInt = parseFloat(document.getElementById('xInterval').value) || 5;
             let yInt = parseFloat(document.getElementById('yInterval').value) || 0.1;
-            
-            // Prevent infinite loops if user enters 0 or negative intervals
             if (xInt <= 0) xInt = 5;
             if (yInt <= 0) yInt = 0.1;
 
+            // --- Clear Canvas to Black ---
             ctx.fillStyle = '#000000';
             ctx.fillRect(0, 0, width, height);
 
+            // --- DRAW TITLE DIRECTLY ON CANVAS (So it's on PNG) ---
+            const canvasTitleText = `${currentFloatName} float pressure graph`;
+            ctx.fillStyle = '#00ff00'; // Match UI header color
+            ctx.font = 'bold 24px Arial';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'top';
+            // Placed at the top center of the image, 20px down.
+            ctx.fillText(canvasTitleText, width / 2, 20);
+
+            // --- Calc Bounds ---
             const minTime = Math.min(...data.map(d => d.time));
             const maxTime = Math.max(...data.map(d => d.time));
             const minDepth = Math.min(...data.map(d => d.depth));
@@ -197,6 +210,7 @@
             const getX = (t) => padLeft + (t - minTime) * scaleX;
             const getY = (d) => height - padBottom - (d - minDepth) * scaleY;
 
+            // --- AXES ---
             ctx.strokeStyle = '#ffffff';
             ctx.lineWidth = 2;
             ctx.beginPath();
@@ -205,24 +219,30 @@
             ctx.lineTo(width - padRight, height - padBottom);
             ctx.stroke();
 
+            // --- Axis Label Styles ---
             ctx.fillStyle = '#ffffff';
             ctx.font = 'bold 16px Arial';
 
             // Y-Axis Label
             ctx.save();
-            ctx.translate(30, height / 2);
+            ctx.translate(30, (padTop + (height - padBottom)) / 2); // Vertically centered to the plotting area
             ctx.rotate(-Math.PI / 2);
             ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
             ctx.fillText("Depth (m)", 0, 0);
             ctx.restore();
 
             // X-Axis Label
             ctx.textAlign = 'center';
+            ctx.textBaseline = 'bottom';
             ctx.fillText("Time (s)", width / 2, height - 20);
 
+            // --- Index Styles ---
             ctx.font = '14px Arial';
+            ctx.textBaseline = 'middle'; // Reset baseline for numbers
 
             // --- X-AXIS INDEXING ---
+            ctx.textAlign = 'center';
             // Draw exact Min/Max time first
             ctx.fillText(Math.round(minTime) + "s", getX(minTime), height - padBottom + 25);
             ctx.fillText(Math.round(maxTime) + "s", getX(maxTime), height - padBottom + 25);
@@ -251,8 +271,7 @@
 
             // Draw custom intervals for Depth
             let startY = Math.ceil(minDepth / yInt) * yInt;
-            // A slight fix to floating point errors in JavaScript loops
-            let safeMaxDepth = maxDepth + (yInt * 0.01); 
+            let safeMaxDepth = maxDepth + (yInt * 0.01); // Floating point safety
             for (let d = startY; d <= safeMaxDepth; d += yInt) {
                 // Skip if custom interval overlaps with exact min/max bounds
                 if (Math.abs(getY(d) - getY(minDepth)) < 20 || Math.abs(getY(d) - getY(maxDepth)) < 20) continue;
@@ -289,6 +308,7 @@
         function downloadGraph() {
             const canvas = document.getElementById('graphCanvas');
             const link = document.createElement('a');
+            // The title is already drawn on the canvas now, we just save it.
             link.download = `${currentFloatName}_Depth_Graph.png`;
             link.href = canvas.toDataURL('image/png');
             link.click();
