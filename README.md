@@ -19,3 +19,8 @@ paste code in VSCode
 install LIVE SERVER extension
 right click code in VScode
 press run live server
+
+
+
+LEGACY:
+https://github.com/judeliucodex/sscfloat_2026/tree/main
