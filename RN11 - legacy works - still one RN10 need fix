@@ -125,7 +125,7 @@ void sensorTask(void *parameter) {
       if (millis() - lastLogTime >= currentLogInterval) {
         if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
           unsigned long floatTimeSec = millis() / 1000;
-          snprintf(dataPackets[sensorIdx], 32, "RN10 %lus SENSOR_ERROR", floatTimeSec);
+          snprintf(dataPackets[sensorIdx], 32, "RN11 %lus SENSOR_ERROR", floatTimeSec);
           sensorIdx = (sensorIdx + 1) % MAX_PACKETS;
           iterationCount++;
           lastLogTime = millis();
